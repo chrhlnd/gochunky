@@ -25,7 +25,13 @@ type Processor interface {
 	request( in []byte, out OutFn )(bool)
 }
 
-type ChunkProcessor func ( req ChunkService, d []byte, out *bytes.Buffer )
+type Injector interface {
+	Write( data []byte )
+}
+
+type InjectorReceiver func ( inject Injector )
+
+type ChunkProcessor func ( req ChunkService, chunk []byte, respond OutFn )
 type respond func( []byte )
 
 type hState int
@@ -50,7 +56,6 @@ type HTTPProcessor struct {
 	extmap		map[string]string
 	theaders	map[string]string
 
-	resbuf	*bytes.Buffer
 	inbuf	*bytes.Buffer
 
 	chunksz	uint
@@ -173,7 +178,7 @@ func (self *HTTPProcessor) parseHeaders() {
 	self.inbuf.Next( end + len(LINE_TERM) )
 }
 
-func (self *HTTPProcessor) parseTrailer() {
+func (self *HTTPProcessor) parseTrailer( out OutFn ) {
 	data := self.inbuf.Bytes()
 
 	if len(data) == 0 {
@@ -185,8 +190,7 @@ func (self *HTTPProcessor) parseTrailer() {
 	if term == 0 {
 		self.inbuf.Next( len(LINE_TERM) )
 		if self.processor != nil {
-			sink := new (bytes.Buffer)
-			self.processor( self, nil, sink )
+			self.processor( self, nil, out )
 		}
 		self.state = DONE
 		return
@@ -286,28 +290,35 @@ func (self *HTTPProcessor) parseChunkSz() {
 }
 
 func (self *HTTPProcessor) startResponse( out OutFn ) {
-	self.resbuf = new(bytes.Buffer)
+	buff := new(bytes.Buffer)
 
-	self.resbuf.WriteString( "HTTP/1.1 200 OK\r\n" )
-	self.resbuf.WriteString( "Content-Type: application/json; charset=UTF-8\r\n" )
-	self.resbuf.WriteString( "Transfer-Encoding: chunked\r\n" )
-	self.resbuf.WriteString( "\r\n" )
+	buff.WriteString( "HTTP/1.1 200 OK\r\n" )
+	buff.WriteString( "Content-Type: application/json; charset=UTF-8\r\n" )
+	buff.WriteString( "Transfer-Encoding: chunked\r\n" )
+	buff.WriteString( "\r\n" )
 
-	out( self.resbuf.Next( self.resbuf.Len() ) )
+	out( buff.Bytes() )
 }
 
 func (self *HTTPProcessor) endResponse( out OutFn ) {
 	fmt.Println("endResponse")
-	self.writeChunk(out)
+	self.writeChunk(nil, out)
 }
 
-func (self *HTTPProcessor) writeChunk( out OutFn ) {
+func (self *HTTPProcessor) writeChunk( data []byte, out OutFn ) {
 	sizeDesc := new(bytes.Buffer)
-	fmt.Fprintf(sizeDesc, "%X", self.resbuf.Len())
+	if data != nil {
+		fmt.Fprintf(sizeDesc, "%X", len(data))
+	} else {
+		fmt.Fprint(sizeDesc, "0")
+	}
 	sizeDesc.Write( LINE_TERM )
-	self.resbuf.Write( LINE_TERM )
-	out( sizeDesc.Next( sizeDesc.Len() ) )
-	out( self.resbuf.Next(self.resbuf.Len() ) )
+
+	out( sizeDesc.Bytes() )
+	if data != nil {
+		out( data )
+	}
+	out( LINE_TERM )
 }
 
 func (self *HTTPProcessor) parseChunk( out OutFn ) {
@@ -317,10 +328,9 @@ func (self *HTTPProcessor) parseChunk( out OutFn ) {
 
 	d := self.inbuf.Next( int(self.chunksz) )
 	if self.processor != nil {
-		self.processor( self, d, self.resbuf )
-		if self.resbuf.Len() > 0 {
-			self.writeChunk( out )
-		}
+		self.processor( self, d, func (data []byte) {
+			self.writeChunk(data, out)
+		})
 	}
 
 	if self.chunksz == 0 {
@@ -382,7 +392,7 @@ func (self *HTTPProcessor) request( in []byte, out OutFn ) (bool) {
 				break
 			case TRAILER:
 				fmt.Println("Starting trailer...")
-				self.parseTrailer()
+				self.parseTrailer( out )
 				break
 			case DONE:
 				self.endResponse( out )
@@ -403,17 +413,24 @@ func (self *HTTPProcessor) request( in []byte, out OutFn ) (bool) {
 
 const NUM_WORKERS = 1
 
-func chunkP( req ChunkService, d []byte, out *bytes.Buffer ) {
+func crazyWrite( out OutFn ) {
+	b := new(bytes.Buffer)
+	b.WriteString("KKK RAZY RIGHT\r\n")
+
+	fmt.Println("Doing crazy line")
+	out( b.Bytes() )
+	fmt.Println("Done crazy line")
+}
+
+func chunkP( req ChunkService, d []byte, out OutFn ) {
 	if len(d) > 0 {
+		go crazyWrite( out )
+
 		str := bytes.NewBuffer(d).String()
-		fmt.Print(str)
-		headers := req.HEADERS()
-		fmt.Printf("\n--HEADERS--\n")
-		for k,v := range(headers) {
-			fmt.Printf( "%s = %s\n", k, v )
-		}
-		fmt.Printf("\n--HEADERS--\n")
-		fmt.Fprintf(out, "Ok got your chunk of %d\r\n", len(d))
+		fmt.Println("[",str,"]")
+		b := new(bytes.Buffer)
+		fmt.Fprintf(b,  "Got your %d bytes. bitch!\r\n", len(d))
+		out( b.Bytes() )
 	} else {
 		fmt.Println("Closing got bytes of 0 size")
 	}
@@ -486,10 +503,43 @@ func handleClient( worker int, chanAccept chan *net.TCPListener, done chan bool,
 	done <- true
 }
 
+type dataT struct {
+	data []byte
+	closeup bool
+	wrote chan bool
+}
+
+func connWriter( conn *net.Conn, dpipe chan *dataT ) {
+	for {
+		info := <-dpipe
+		if info.data != nil {
+			_, err2 := (*conn).Write( info.data )
+			if err2 != nil {
+				fmt.Fprintln(os.Stderr, "Error writing to connection ", err2)
+			}
+			info.wrote <- true
+		}
+		if info.closeup == true {
+			(*conn).Close()
+			break
+		}
+	}
+}
+
 func serviceClientConn( parent int, conn *net.Conn, spawn int, processor Processor) {
 	fmt.Println("Processing spawn ", spawn)
 	var in [4096] byte
-	var err2 error
+	var isdone bool
+
+	outchan := make( chan *dataT )
+
+	var syncDT = new (dataT)
+	syncDT.wrote = make( chan bool )
+
+	var wsyn = make( chan bool, 1)
+	wsyn <- true
+
+	go connWriter( conn, outchan )
 
 	for {
 		n, err := (*conn).Read( in[0:] )
@@ -499,37 +549,26 @@ func serviceClientConn( parent int, conn *net.Conn, spawn int, processor Process
 			break
 		}
 
-		isdone := processor.request( in[0:n], func ( out []byte ) {
-			_, err2 = (*conn).Write( out )
-			if err2 != nil {
-				fmt.Println(os.Stderr, "Error writing to connection ", err2)
-			}
+		isdone = processor.request( in[0:n], func ( out []byte ) {
+			<-wsyn
+			fmt.Print("Writting [", bytes.NewBuffer(out).String(), "]")
+			syncDT.data = out
+			syncDT.closeup = false
+			outchan <- syncDT
+			<-syncDT.wrote
+			wsyn <- true
 		})
 
-		if err2 != nil {
-			fmt.Fprintf(os.Stderr, "Write Fatal Error: %s\n", err2.Error())
-			break
-		}
-
 		if isdone {
+			syncDT.data = nil
+			syncDT.closeup = true
+			outchan <- syncDT
 			break
 		}
-
-		/*
-		os.Stdout.Write( buf[0:n] )
-		os.Stdout.Sync()
-		*/
-		/*
-		_, err2 := (*conn).Write(buf[0:n])
-		if err2 != nil {
-			break
-		}
-		*/
 	}
 
-	fmt.Println("Closing spawn ", spawn)
-	(*conn).Close()
-
+	//fmt.Println("Closing spawn ", spawn)
+	//(*conn).Close()
 }
 
 func checkError( err error ) {
