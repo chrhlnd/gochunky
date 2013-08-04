@@ -1,11 +1,11 @@
 
-server: server.go
-	go build -gcflags "-N -l"  server.go
+debug: chunky/chunky.go chunky_srv.go
+	go build -gcflags "-N -l" chunky_srv.go
 
-release: server.go
-	go build server.go
+release: chunky/chunky.go chunky_srv.go
+	go build chunky_srv.go
 
 clean:
-	rm -f server
+	rm -f chunky_srv
 
-all: server
+all: debug

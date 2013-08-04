@@ -15,8 +15,8 @@ import (
 		Serve( someaddr, chunkbeginsessioncallback )
 			- some client connects
 				-> chunkbeginsessioncallback( sessionobj )
-					*YOU* fillin sessionobj.OnReceive
-						  fillin sessionobj.OnClose
+					*YOU* SetOnReceive()
+						  SetOnClose()
 
 				the OnReceive will be called with each new chunk
 				the OnClose will be called when a close is detected
@@ -26,21 +26,19 @@ import (
 		Connect( someaddr, chunkbeginsessioncallback )
 			- connect to some server
 				-> chunkbeginsessioncallback( sessionobj )
-					*YOU* fillin sessionobj.OnReceive
-						  fillin sessionobj.OnClose
+					*YOU* SetOnReceive()
+						  SetOnClose()
 
 				*Same process as above
-
-		NOTE DoSend is syncronized across all go routines so no dups of data should have to
-		     be made in the runtime, the socket will buffer, but all sends sync for a connection
-
-			 So if you've referenced the DoSend in multiple go routines its still going to send
-			 syncronisly on that connection, which actually makes sense.
-
+	
+	NOTE: any connections' 'ChunkSender' is synced
+			so copying the ChunkSender around to multiple producers should be safe.
+			Not sure why you would want to do that, but I don't know what you're trying to do if
+			you do something like this.
 */
 
 type ChunkReceiver		func(ChunkSession,Chunk)
-type ChunkSender		func(ChunkSession,[]byte,map[string]string)
+type ChunkSender		func(ChunkSession,[]byte,map[string]string)(bool)
 type ChunkCloser		func(ChunkSession)
 type ChunkBeginSession	func(ChunkSession)
 
@@ -51,6 +49,7 @@ type ChunkSession interface {
 	HEADERS()	(map[string]string)
 	TRAILERS()	(map[string]string)
 
+	IsClosed()(bool)
 	SetOnReceive(ChunkReceiver)	// fill this in to get called
 	SetOnClose(ChunkCloser)		// fill this one in too
 	GetSend()(ChunkSender)			// use this to send
@@ -92,6 +91,7 @@ type hTTPProcessor struct {
 	onreceive	ChunkReceiver
 	onclose		ChunkCloser
 	send		func([]byte)
+	closed		bool
 }
 
 func (self *hTTPProcessor)SetOnReceive( fn ChunkReceiver) {
@@ -102,16 +102,24 @@ func (self *hTTPProcessor)SetOnClose( fn ChunkCloser ) {
 	self.onclose = fn
 }
 
-func chunkSend( obj ChunkSession, data []byte, ext map[string]string ) {
-	hproc, ok := obj.(*hTTPProcessor)
+func chunkSend( self ChunkSession, data []byte, ext map[string]string )(bool) {
+	if self.IsClosed() {
+		return false
+	}
+	hproc, ok := self.(*hTTPProcessor)
 	if ok {
 		hproc.writeChunk( data, ext )
+		return true
 	}
+	return false
 }
-
 
 func (self *hTTPProcessor)GetSend()(ChunkSender) {
 	return chunkSend
+}
+
+func (self *hTTPProcessor)IsClosed()(bool) {
+	return self.closed == true
 }
 
 var line_term			= [...]byte{0x0D,0x0A}
@@ -422,6 +430,7 @@ func (self *hTTPProcessor) request( in []byte ) (bool) {
 				self.parseHeaders()
 				if self.state > HEADERS {
 					if self.onbegin != nil {
+						self.closed = false
 						self.onbegin( self )
 					}
 
@@ -454,6 +463,7 @@ func (self *hTTPProcessor) request( in []byte ) (bool) {
 				if self.onclose != nil {
 					self.onclose( self )
 				}
+				self.closed = true
 				fmt.Println("Starting done...")
 				fmt.Println("Closing data count in buffer is ", self.inbuf.Len())
 				return true
