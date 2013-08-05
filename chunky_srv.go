@@ -12,10 +12,10 @@ const NUM_WORKERS = 1
 func sesGotChunk( ses chunky.ChunkSession, chunk chunky.Chunk ) {
 	d := chunk.GetData()
 
-	fmt.Println("Got Chunk data len",len(d))
+	fmt.Println("SERVER GOT: ", bytes.NewBuffer( d ).String() )
 
 	b := new(bytes.Buffer)
-	fmt.Fprintf(b,  "Got your %d bytes. bitch!\r\n", len(d))
+	fmt.Fprintf(b,  "Got your %d bytes. bitch", len(d))
 
 	ses.GetSend()( ses, b.Bytes(), nil )
 }

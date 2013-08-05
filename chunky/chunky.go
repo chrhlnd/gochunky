@@ -7,12 +7,13 @@ import (
 	"bytes"
 	"strconv"
 	"strings"
+	"io"
 )
 
 /*
 	Main flow works like this...
 
-		Serve( someaddr, chunkbeginsessioncallback )
+		Serve( someaddr, workercount, chunkbeginsessioncallback )
 			- some client connects
 				-> chunkbeginsessioncallback( sessionobj )
 					*YOU* SetOnReceive()
@@ -23,11 +24,10 @@ import (
 
 				the DoSend should be used by you to inject chunks going the other way
 
-		Connect( someaddr, chunkbeginsessioncallback )
+		Connect( someaddr, ChunkBeginSession )(err)
 			- connect to some server
-				-> chunkbeginsessioncallback( sessionobj )
-					*YOU* SetOnReceive()
-						  SetOnClose()
+				*YOU* SetOnReceive()
+					  SetOnClose()
 
 				*Same process as above
 	
@@ -49,6 +49,9 @@ type ChunkSession interface {
 	HEADERS()	(map[string]string)
 	TRAILERS()	(map[string]string)
 
+	CODE()		(string)
+	MESSAGE()	(string)
+
 	IsClosed()(bool)
 	SetOnReceive(ChunkReceiver)	// fill this in to get called
 	SetOnClose(ChunkCloser)		// fill this one in too
@@ -62,13 +65,15 @@ type Chunk interface {
 
 type hState int
 const (
-	METHOD		= 0
-	HEADERS		= 1
-	BODY		= 2
-	CHUNK		= 3
-	BLANKLINE	= 4
-	TRAILER		= 5
-	DONE		= 6
+	METHOD			= 0
+	HEADERS			= 1
+	BODY			= 2
+	CHUNK			= 3
+	BLANKLINE		= 4
+	TRAILER			= 5
+	DONE			= 6
+	CLIENTSEND		= 7
+	CLIENTCONNECT	= 8
 )
 
 type hTTPProcessor struct {
@@ -81,6 +86,10 @@ type hTTPProcessor struct {
 	headers		map[string]string
 	extmap		map[string]string
 	theaders	map[string]string
+
+	cheaders	map[string]string
+	code		string // client side connection support
+	message		string
 
 	inbuf		*bytes.Buffer
 
@@ -108,6 +117,7 @@ func chunkSend( self ChunkSession, data []byte, ext map[string]string )(bool) {
 	}
 	hproc, ok := self.(*hTTPProcessor)
 	if ok {
+		//fmt.Println( " Writing", data )
 		hproc.writeChunk( data, ext )
 		return true
 	}
@@ -159,6 +169,14 @@ func (self *hTTPProcessor) TRAILERS() (map[string]string) {
 	return self.theaders
 }
 
+func (self *hTTPProcessor) CODE() (string) {
+	return self.code
+}
+
+func (self *hTTPProcessor) MESSAGE() (string) {
+	return self.message
+}
+
 func (self *hTTPProcessor) GetData()([]byte) {
 	return self.chunkData
 }
@@ -204,41 +222,52 @@ func (self *hTTPProcessor) parseMethod() {
 	self.state = HEADERS
 }
 
-
-func (self *hTTPProcessor) parseHeaders() {
-	if self.inbuf.Len() == 0 {
-		return // more data
+func parseHeaders( inbuf *bytes.Buffer, headers map[string]string )(bool) {
+	if inbuf.Len() == 0 {
+		return false // more data
 	}
 
-	data := self.inbuf.Bytes()
+	data := inbuf.Bytes()
+	// fmt.Println( " Data is ", bytes.NewBuffer(data).String())
 
 	term := bytes.Index( data, LINE_TERM ) // look for a blank line
 	if term == 0 {
-		self.inbuf.Next( len(LINE_TERM) )
-		self.state = BODY
-		return
+		inbuf.Next( len(LINE_TERM) )
+		return true
 	}
 
 	sep := bytes.Index( data, KV_SEP )
 
 	if sep < 0 {
-		return // don't have enough data yet
+		return false // don't have enough data yet
 	}
 
 	end := bytes.Index( data, LINE_TERM )
 
 	if end < 0 {
-		return // not enough data for a k,v pair
+		return false // not enough data for a k,v pair
 	}
+
 
 	key := strings.Trim( bytes.NewBuffer( data[0:sep] ).String(), SPACE )
 	val := strings.Trim( bytes.NewBuffer( data[sep+len(KV_SEP):end] ).String(), SPACE )
 
-	if self.headers == nil { self.headers = make(map[string]string) }
-	self.headers[key] = val
+	headers[key] = val
 
 	// read out the data fron inbuf
-	self.inbuf.Next( end + len(LINE_TERM) )
+	inbuf.Next( end + len(LINE_TERM) )
+	return false // ok read 1 header
+}
+
+func (self *hTTPProcessor) parseHeaders() {
+	if self.headers == nil {
+		self.headers = make( map[string]string )
+	}
+
+	if parseHeaders( self.inbuf, self.headers ) {
+		self.state = BODY
+		return
+	}
 }
 
 func (self *hTTPProcessor) parseTrailer() {
@@ -361,7 +390,7 @@ func (self *hTTPProcessor) startResponse() {
 }
 
 func (self *hTTPProcessor) endResponse() {
-	fmt.Println("endResponse")
+	//fmt.Println("endResponse")
 	self.writeChunk(nil,nil)
 }
 
@@ -407,7 +436,7 @@ func (self *hTTPProcessor) parseBlankLine() {
 	}
 
 	data = self.inbuf.Next( pos + len( LINE_TERM ) )
-	fmt.Println("DBG: tossing ", data, " Nextstate is ", self.nextstate)
+	//fmt.Println("DBG: tossing ", data, " Nextstate is ", self.nextstate)
 	self.state = self.nextstate
 }
 
@@ -459,7 +488,7 @@ func (self *hTTPProcessor) request( in []byte ) (bool) {
 				self.parseTrailer()
 				break
 			case DONE:
-				self.endResponse()
+				//self.endResponse()
 				if self.onclose != nil {
 					self.onclose( self )
 				}
@@ -467,6 +496,9 @@ func (self *hTTPProcessor) request( in []byte ) (bool) {
 				fmt.Println("Starting done...")
 				fmt.Println("Closing data count in buffer is ", self.inbuf.Len())
 				return true
+			case CLIENTCONNECT:
+				self.parseClientConnect()
+				break
 		}
 		if self.state != TRAILER && self.state != DONE {
 			if self.inbuf.Len() < 1 {
@@ -478,10 +510,102 @@ func (self *hTTPProcessor) request( in []byte ) (bool) {
 	return false
 }
 
+func (self *hTTPProcessor) parseClientConnect() {
+
+	data := self.inbuf.Bytes()
+
+	pos := bytes.Index( data, LINE_TERM )
+	if pos < 0 {
+		return // need more
+	}
+
+	var space int
+
+	if self.proto == "" {
+		space = bytes.Index( data, METH_SEP )
+		if space < 0 {
+			return // mal formed response?
+		}
+		self.proto = bytes.NewBuffer( self.inbuf.Next( space ) ).String()
+		self.inbuf.Next( len(METH_SEP) ) // advance pass seperator
+		data = self.inbuf.Bytes()
+	}
+
+	if self.code == "" {
+		space = bytes.Index( data, METH_SEP )
+		if space < 0 {
+			return // mal formed response?
+		}
+		self.code = bytes.NewBuffer( self.inbuf.Next( space ) ).String()
+		self.inbuf.Next( len(METH_SEP) ) // advance pass seperator
+		data = self.inbuf.Bytes()
+	}
+
+	if self.message == "" {
+		pos = bytes.Index( data, LINE_TERM )
+		if pos < 0 {
+			return // mal formed
+		}
+		self.message = bytes.NewBuffer( self.inbuf.Next( pos ) ).String()
+		self.inbuf.Next( len(LINE_TERM) )
+		data = self.inbuf.Bytes()
+	}
+
+	if self.headers == nil {
+		self.headers = make( map[string]string )
+	}
+
+	if parseHeaders( self.inbuf, self.headers ) {
+		self.state = BODY
+		self.onbegin( self )
+		// ok connection setup now call the session begin
+		return
+	}
+}
+
+func ( self *hTTPProcessor ) sendConnect() {
+	// start a http session
+	buff := new(bytes.Buffer)
+
+	fmt.Fprintf(buff, "POST %s HTTP/1.1\r\n", self.uri)
+	if self.cheaders != nil {
+		for key, val := range( self.cheaders ) {
+			if key != "Content-Type" && key != "Transfer-Encoding" {
+				fmt.Fprintf(buff, "%s: %s\r\n", key, val)
+			}
+		}
+	}
+	fmt.Fprintf(buff, "Transfer-Encoding: chunked\r\n" )
+	buff.WriteString( "\r\n" )
+
+	self.send( buff.Bytes() )
+
+	self.state = CLIENTCONNECT
+}
+
+// make a client connection
+func Connect( ipport string, uri string, headers map[string]string, onbegin ChunkBeginSession)(error) {
+	conn, err := net.Dial( "tcp", ipport )
+	if err != nil {
+		return fmt.Errorf("Resolve error %s", err)
+	}
+
+	proc := new (hTTPProcessor)
+	proc.onbegin	= onbegin
+	proc.cheaders	= headers
+	proc.uri		= uri
+
+	proc.state = CLIENTSEND
+
+	serviceClientConn( 0, &conn, 0, proc )
+	return nil
+}
+
+// make a server
 func Serve( addr string, workerCount int, begin ChunkBeginSession)(error) {
 	tcpAddr, err := net.ResolveTCPAddr("tcp4", addr)
 	if err != nil {
-		return fmt.Errorf("Resovle error %s", err)
+		return fmt.Errorf("Resolve error %s", err)
 	}
 
 	listener, err := net.ListenTCP( "tcp", tcpAddr )
@@ -560,22 +684,31 @@ type dataT struct {
 func connWriter( conn *net.Conn, dpipe chan *dataT ) {
 	for {
 		info := <-dpipe
-		if info.data != nil {
+		if info.data != nil && len(info.data) > 0 {
 			_, err2 := (*conn).Write( info.data )
 			if err2 != nil {
-				fmt.Fprintln(os.Stderr, "Error writing to connection ", err2)
+				fmt.Fprintln(os.Stderr,
+						"Error writing to connection(",
+						err2,
+						")data(",
+						info.data,
+						")")
 			}
 			info.wrote <- true
 		}
 		if info.closeup == true {
+			//fmt.Println("Closing WRITER")
 			(*conn).Close()
+			fmt.Println("Communicating KILL")
+			//info.wrote <- true
+			fmt.Println("Done with write loop")
 			break
 		}
 	}
 }
 
 func serviceClientConn( parent int, conn *net.Conn, spawn int, processor *hTTPProcessor) {
-	fmt.Println("Processing spawn ", spawn)
+	//fmt.Println("Processing spawn ", spawn)
 	var in [4096] byte
 	var isdone bool
 
@@ -599,12 +732,19 @@ func serviceClientConn( parent int, conn *net.Conn, spawn int, processor *hTTPPr
 	}
 
 	processor.send = writer
+	if processor.state == CLIENTSEND {
+		processor.sendConnect()
+	}
 
 	for {
 		n, err := (*conn).Read( in[0:] )
 
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Read Fatal Error: %s\n", err.Error())
+			if err == io.EOF {
+				//fmt.Println("Connection closed by EOF")
+			} else {
+				fmt.Fprintf(os.Stderr, "Read Fatal Error: %s\n", err.Error())
+			}
 			break
 		}
 
@@ -613,9 +753,12 @@ func serviceClientConn( parent int, conn *net.Conn, spawn int, processor *hTTPPr
 		if isdone {
 			syncDT.data = nil
 			syncDT.closeup = true
+			//fmt.Println("Closing sender")
 			outchan <- syncDT
+			//fmt.Println("Done Closing sender")
 			break
 		}
 	}
+	fmt.Println("Done servicing conn")
 }
 
